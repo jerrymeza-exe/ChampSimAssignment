@@ -1,18 +1,19 @@
 #include <vector>
-#include <cassert>
 #include <unordered_map>
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <cassert>
+#include <climits>
 
+// Include necessary ChampSim headers
 #include "cache.h"
 
 // Constants
 const int INITIAL_TABLE_SIZE = 256;
 const int MAX_WEIGHT = 31; // Saturating counters max value
 const int MIN_WEIGHT = -32; // Saturating counters min value
-const int THRESHOLD = 3; // Threshold for prediction
 const float LEAKY_RELU_ALPHA = 0.01f; // Leaky ReLU parameter
 
 // Weight Table for Features
@@ -20,7 +21,11 @@ struct WeightTable {
     std::vector<int8_t> weights;
     int size;
 
-    WeightTable(int table_size) : size(table_size), weights(table_size, 0) {}
+    // Default constructor
+    WeightTable() : weights(INITIAL_TABLE_SIZE, 0), size(INITIAL_TABLE_SIZE) {}
+
+    // Constructor with table size
+    WeightTable(int table_size) : weights(table_size, 0), size(table_size) {}
 
     void resize(int new_size) {
         std::vector<int8_t> new_weights(new_size, 0);
@@ -39,14 +44,11 @@ public:
     std::unordered_map<std::string, int> table_usage_count;
 
     PerceptronPredictor() {
-        feature_tables["pc"] = WeightTable(INITIAL_TABLE_SIZE);
-        feature_tables["mem_instr_pc"] = WeightTable(INITIAL_TABLE_SIZE);
-        feature_tables["mem_addr_bits"] = WeightTable(INITIAL_TABLE_SIZE);
-        feature_tables["data_content"] = WeightTable(INITIAL_TABLE_SIZE);
-        feature_tables["time_ref_count"] = WeightTable(INITIAL_TABLE_SIZE);
-        feature_tables["cycles_not_accessed"] = WeightTable(INITIAL_TABLE_SIZE);
-        feature_tables["read_write"] = WeightTable(INITIAL_TABLE_SIZE);
-        feature_tables["block_age"] = WeightTable(INITIAL_TABLE_SIZE);
+        // Initialize feature tables with default size
+        feature_tables["pc"] = WeightTable();
+        feature_tables["setIndex"] = WeightTable();
+        feature_tables["is_write"] = WeightTable();
+        // Add other features as needed
     }
 
     int compute_prediction(const std::unordered_map<std::string, uint64_t>& features, uint64_t pc);
@@ -69,7 +71,7 @@ int PerceptronPredictor::compute_prediction(const std::unordered_map<std::string
         yout += table.weights[index];
     }
 
-    // Apply ReLU or Leaky ReLU
+    // Apply Leaky ReLU
     return (yout > 0) ? yout : static_cast<int>(LEAKY_RELU_ALPHA * yout);
 }
 
@@ -102,30 +104,50 @@ void PerceptronPredictor::dynamic_resize() {
 // Global Predictor Instance
 static PerceptronPredictor perceptron;
 
+// Metadata structure
+struct BlockMetadata {
+    uint64_t pc = 0;
+    bool is_write = false;
+    // Add other features as needed
+};
+
+// Number of sets and ways (adjust these based on your cache configuration)
+constexpr uint32_t NUM_SET = 2048;  // Example: 2048 sets
+constexpr uint32_t NUM_WAY = 16;    // Example: 16 ways
+
+// Metadata array indexed by set and way
+BlockMetadata metadata_array[NUM_SET][NUM_WAY];
+
 // Extract features for the predictor
-std::unordered_map<std::string, uint64_t> extract_features(const BLOCK& block, uint64_t current_cycle) {
+std::unordered_map<std::string, uint64_t> extract_features(const BlockMetadata& metadata, uint32_t setIndex) {
     return {
-        {"pc", block.pc},
-        {"mem_instr_pc", block.pc}, // Assuming block.pc holds memory instruction PC
-        {"mem_addr_bits", block.full_addr >> 4}, // Use tag bits
-        {"data_content", block.data_hash}, // Assume block contains a hash of its data
-        {"time_ref_count", block.ref_count}, // Reference count
-        {"cycles_not_accessed", current_cycle - block.last_access_cycle},
-        {"read_write", block.is_write ? 1 : 0},
-        {"block_age", current_cycle - block.creation_cycle}
+        {"pc", metadata.pc},
+        {"setIndex", setIndex},
+        {"is_write", metadata.is_write ? 1 : 0}
+        // Add other features as needed
     };
 }
 
-// Find victim block for eviction
-uint32_t CACHE::find_victim(uint32_t set, const BLOCK* current_set, uint64_t current_pc) {
+// **Define the member functions of CACHE class**
+
+void CACHE::repl_replacementDpcn_initialize_replacement() {
+    // Initialize the perceptron predictor if needed
+    perceptron = PerceptronPredictor();
+}
+
+uint32_t CACHE::repl_replacementDpcn_find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t setIndex, const BLOCK* current_set, uint64_t ip,
+                                                 uint64_t full_addr, uint32_t type) {
     uint32_t victim = 0;
     int32_t min_yout = INT32_MAX;
 
+    // Loop over all ways in the set
     for (uint32_t way = 0; way < NUM_WAY; ++way) {
-        auto features = extract_features(current_set[way], current_cycle);
-        int32_t yout = perceptron.compute_prediction(features, current_pc);
+        const BlockMetadata& metadata = metadata_array[setIndex][way];
 
-        if (yout > THRESHOLD && yout < min_yout) {
+        auto features = extract_features(metadata, setIndex);
+        int32_t yout = perceptron.compute_prediction(features, ip);
+
+        if (yout < min_yout) {
             min_yout = yout;
             victim = way;
         }
@@ -134,13 +156,25 @@ uint32_t CACHE::find_victim(uint32_t set, const BLOCK* current_set, uint64_t cur
     return victim;
 }
 
-// Update replacement state
-void CACHE::update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type,
-                                     uint8_t hit) {
-    auto features = extract_features(cache_sets[set][way], current_cycle);
-    bool is_correct = hit || (type == access_type::WRITE); // Example correctness condition
+void CACHE::repl_replacementDpcn_update_replacement_state(uint32_t triggering_cpu, uint32_t setIndex, uint32_t wayID, uint64_t full_addr, uint64_t ip,
+                                                          uint64_t victim_addr, uint32_t type, uint8_t hit) {
+    // Update the block metadata
+    BlockMetadata& metadata = metadata_array[setIndex][wayID];
+    metadata.pc = ip;
+    metadata.is_write = (static_cast<access_type>(type) == access_type::WRITE);
+
+    // Extract features
+    auto features = extract_features(metadata, setIndex);
+
+    // Call perceptron update
+    bool is_correct = hit;
     perceptron.update_weights(features, ip, is_correct);
 
     // Optionally, resize tables dynamically
     perceptron.dynamic_resize();
 }
+
+void CACHE::repl_replacementDpcn_replacement_final_stats() {
+    // Any final statistics or cleanup code
+}
+
